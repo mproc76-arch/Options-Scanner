@@ -5,9 +5,11 @@
 #  TradingView Charts, Optional AI (Anthropic API)
 # ============================================================
 
-import sys, time, threading, webbrowser, schedule, requests, os, json, uuid
+import sys, time, threading, webbrowser, schedule, requests, os, json, uuid, random
+import concurrent.futures
 from datetime import datetime, date
 from flask import Flask, jsonify, render_template_string, request
+import pandas as pd
 import yfinance as yf
 import config
 
@@ -57,13 +59,14 @@ def api_add_ticker():
     ticker = ((request.json or {}).get("ticker", "")).upper().strip()
     if not ticker:
         return jsonify({"ok": False, "error": "No ticker"})
-    # Validate via yfinance
+    valid = False
     try:
         info = yf.Ticker(ticker).info
-        if not info.get("regularMarketPrice") and not info.get("currentPrice") and not info.get("navPrice"):
-            return jsonify({"ok": False, "error": f"'{ticker}' not found on Yahoo Finance"})
+        valid = bool(info.get("regularMarketPrice") or info.get("currentPrice") or info.get("navPrice"))
     except Exception:
-        return jsonify({"ok": False, "error": "Could not validate ticker"})
+        pass
+    if not valid:
+        return jsonify({"ok": False, "error": f"'{ticker}' not found"})
     wl = load_watchlist()
     if ticker not in wl:
         wl.append(ticker)
@@ -134,6 +137,7 @@ def get_options_data_tasty(ticker, want_leaps=True, want_puts=True):
         expirations = []
         for item in chain_items:
             expirations.extend(item.get("expirations", [item]))
+        print(f"  [INFO] {ticker}: {len(expirations)} expirations returned by Tastytrade")
         for exp_group in expirations:
             exp_str = exp_group.get("expiration-date", "")
             try:
@@ -179,14 +183,20 @@ def get_options_data_yf(ticker, want_leaps=True, want_puts=True):
     try:
         tk    = yf.Ticker(ticker)
         today = date.today()
-        hist  = tk.history(period="2d", interval="1d")
+        hist  = _yf_history(ticker, period="2d", interval="1d")
         if hist.empty:
             return results
         price = float(hist["Close"].iloc[-1])
         if not price:
             return results
 
-        for exp_str in (tk.options or []):
+        with _YF_SEM:
+            try:
+                expirations = tk.options or []
+            except Exception:
+                expirations = []
+
+        for exp_str in expirations:
             try:
                 exp_date = date.fromisoformat(exp_str)
             except Exception:
@@ -194,9 +204,16 @@ def get_options_data_yf(ticker, want_leaps=True, want_puts=True):
             dte = (exp_date - today).days
             if dte < 1:
                 continue
-            try:
-                chain = tk.option_chain(exp_str)
-            except Exception:
+            chain = None
+            with _YF_SEM:
+                for attempt in range(2):
+                    try:
+                        chain = tk.option_chain(exp_str)
+                        break
+                    except Exception:
+                        if attempt < 1:
+                            time.sleep(1.0 + random.random())
+            if chain is None:
                 continue
 
             if want_leaps and config.LEAPS_MIN_DTE <= dte <= config.LEAPS_MAX_DTE:
@@ -241,135 +258,8 @@ def get_options_data_yf(ticker, want_leaps=True, want_puts=True):
         print(f"  [WARN] yf options fallback {ticker}: {e}")
     return results
 
-def get_options_data_polygon(ticker, want_leaps=True, want_puts=True):
-    """Polygon.io real-time options chain — live Greeks, real bid/ask/IV."""
-    key = getattr(config, "POLYGON_API_KEY", "")
-    if not key:
-        return []
-    results = []
-    today = date.today()
-    try:
-        url = f"https://api.polygon.io/v3/snapshot/options/{ticker}"
-        params = {
-            "apiKey": key,
-            "limit": 250,
-            "order": "asc",
-            "sort": "expiration_date",
-        }
-        # Add contract type filter
-        contract_types = []
-        if want_leaps:
-            contract_types.append("call")
-        if want_puts:
-            contract_types.append("put")
-
-        all_contracts = []
-        for ct in contract_types:
-            p = dict(params)
-            p["contract_type"] = ct
-            resp = requests.get(url, params=p, timeout=10)
-            if resp.status_code != 200:
-                print(f"  [WARN] Polygon {ticker} {ct}: HTTP {resp.status_code}")
-                continue
-            data = resp.json()
-            all_contracts.extend(data.get("results", []))
-            # Handle pagination (up to 2 pages)
-            next_url = data.get("next_url")
-            if next_url:
-                r2 = requests.get(next_url + f"&apiKey={key}", timeout=10)
-                if r2.status_code == 200:
-                    all_contracts.extend(r2.json().get("results", []))
-
-        for item in all_contracts:
-            d = item.get("details", {})
-            g = item.get("greeks", {})
-            q = item.get("day", {})
-            iv = item.get("implied_volatility")
-
-            strike     = d.get("strike_price")
-            exp_str    = d.get("expiration_date", "")
-            contract_t = d.get("contract_type", "").lower()
-            delta      = g.get("delta")
-            theta      = g.get("theta")
-            vega       = g.get("vega")
-            bid        = q.get("open") or item.get("last_quote", {}).get("bid")
-            ask        = item.get("last_quote", {}).get("ask")
-            volume     = q.get("volume", 0)
-            open_int   = item.get("open_interest", 0)
-
-            if not strike or not exp_str or not delta:
-                continue
-
-            try:
-                exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
-            except ValueError:
-                continue
-
-            dte = (exp_date - today).days
-            if dte < 0:
-                continue
-
-            mid = round((bid + ask) / 2, 2) if bid and ask else (ask or bid or 0)
-
-            is_leaps = dte >= config.LEAPS_MIN_DTE
-            is_put   = contract_t == "put"
-            is_call  = contract_t == "call"
-
-            abs_delta = abs(delta) if delta else 0
-
-            if want_leaps and is_call and is_leaps:
-                if config.LEAPS_MIN_DELTA <= abs_delta <= config.LEAPS_MAX_DELTA:
-                    results.append({
-                        "type":   "LEAPS call",
-                        "strike": strike,
-                        "exp":    exp_str,
-                        "dte":    dte,
-                        "delta":  round(abs_delta, 2),
-                        "theta":  round(theta, 4) if theta else None,
-                        "vega":   round(vega, 4) if vega else None,
-                        "iv":     round(iv * 100, 1) if iv else None,
-                        "bid":    bid,
-                        "ask":    ask,
-                        "mid":    mid,
-                        "volume": volume,
-                        "oi":     open_int,
-                        "source": "polygon",
-                    })
-
-            if want_puts and is_put and not is_leaps:
-                if config.PUT_MIN_DELTA <= abs_delta <= config.PUT_MAX_DELTA and \
-                   config.PUT_MIN_DTE <= dte <= config.PUT_MAX_DTE:
-                    results.append({
-                        "type":   "short put",
-                        "strike": strike,
-                        "exp":    exp_str,
-                        "dte":    dte,
-                        "delta":  round(abs_delta, 2),
-                        "theta":  round(theta, 4) if theta else None,
-                        "vega":   round(vega, 4) if vega else None,
-                        "iv":     round(iv * 100, 1) if iv else None,
-                        "bid":    bid,
-                        "ask":    ask,
-                        "mid":    mid,
-                        "volume": volume,
-                        "oi":     open_int,
-                        "source": "polygon",
-                    })
-
-    except Exception as e:
-        print(f"  [WARN] Polygon options {ticker}: {e}")
-    return results
-
-
 def get_options_data(ticker, want_leaps=True, want_puts=True):
-    """Priority: Polygon (real-time) → tastytrade → yfinance fallback."""
-    # Try Polygon first if key is configured
-    if getattr(config, "POLYGON_API_KEY", ""):
-        results = get_options_data_polygon(ticker, want_leaps, want_puts)
-        if results:
-            print(f"  [INFO] {ticker}: {len(results)} contracts from Polygon")
-            return results
-    # Try tastytrade
+    """Priority: tastytrade → yfinance fallback."""
     results = get_options_data_tasty(ticker, want_leaps, want_puts)
     if results:
         return results
@@ -383,6 +273,26 @@ def api_options(ticker):
     return jsonify({"options": opts, "count": len(opts)})
 
 # ── Technical indicators ──────────────────────────────────
+# Yahoo rate-limits bursty concurrent requests from one IP. The scan fires up to
+# 12 tickers at once via ThreadPoolExecutor, so yfinance calls go through this
+# semaphore (capped well below 12) with retry/backoff to avoid silently skipping
+# tickers when a request gets throttled.
+_YF_SEM = threading.Semaphore(4)
+
+def _yf_history(ticker, retries=3, **kwargs):
+    with _YF_SEM:
+        for attempt in range(retries):
+            try:
+                hist = yf.Ticker(ticker).history(**kwargs)
+                if not hist.empty:
+                    return hist
+            except Exception:
+                if attempt == retries - 1:
+                    raise
+            time.sleep(1.5 * (attempt + 1) + random.random())
+    return pd.DataFrame()
+
+
 def _compute_indicators_from_hist(hist):
     try:
         if hist.empty or len(hist) < 50:
@@ -443,8 +353,8 @@ def _compute_indicators_from_hist(hist):
         gc = any(ma20.iloc[-_i] > ma50.iloc[-_i] and ma20.iloc[-_i - 1] <= ma50.iloc[-_i - 1] for _i in range(1, min(6, len(ma20))))
         dc = any(ma20.iloc[-_i] < ma50.iloc[-_i] and ma20.iloc[-_i - 1] >= ma50.iloc[-_i - 1] for _i in range(1, min(6, len(ma20))))
 
-        hi52 = float(close.rolling(252).max().iloc[-1]) if len(close) >= 252 else float(close.max())
-        lo52 = float(close.rolling(252).min().iloc[-1]) if len(close) >= 252 else float(close.min())
+        hi52 = float(close.rolling(252, min_periods=1).max().iloc[-1]) if len(close) >= 252 else float(close.max())
+        lo52 = float(close.rolling(252, min_periods=1).min().iloc[-1]) if len(close) >= 252 else float(close.min())
         pfl  = (price - lo52) / (hi52 - lo52) if (hi52 - lo52) else 0.5
 
         return {
@@ -465,7 +375,7 @@ def _compute_indicators_from_hist(hist):
 
 def compute_indicators(ticker):
     try:
-        hist = yf.Ticker(ticker).history(period="1y", interval="1d")
+        hist = _yf_history(ticker, period="1y", interval="1d")
         return _compute_indicators_from_hist(hist)
     except Exception as e:
         print(f"  [ERR] Daily indicators {ticker}: {e}")
@@ -473,18 +383,65 @@ def compute_indicators(ticker):
 
 def compute_indicators_1h(ticker):
     try:
-        hist = yf.Ticker(ticker).history(period="60d", interval="1h")
+        hist = _yf_history(ticker, period="60d", interval="1h")
         return _compute_indicators_from_hist(hist)
     except Exception as e:
         print(f"  [WARN] 1H indicators {ticker}: {e}")
         return None
 
 def get_iv_rank_yf(ticker):
+    """Fallback when Tastytrade has no market-metrics for this symbol (e.g. futures
+    continuous contracts). Uses a realized-volatility percentile (current 20D HV vs.
+    its own trailing 1Y range) as an IV-rank proxy — yfinance's 'impliedVolatility'
+    info field is no longer populated by Yahoo, so it can't be used directly."""
     try:
-        iv = yf.Ticker(ticker).info.get("impliedVolatility") or 0.0
-        return {"iv": round(min(iv * 100, 100), 1), "iv_rank": round(min(iv * 200, 100), 1)}
+        hist = _yf_history(ticker, period="1y", interval="1d")
+        close = hist["Close"]
+        roll_hv = (close.pct_change().rolling(20).std() * (252 ** 0.5) * 100).dropna()
+        if len(roll_hv) < 20:
+            return {"iv": 0, "iv_rank": 0}
+        current = float(roll_hv.iloc[-1])
+        rank    = float((roll_hv < current).mean() * 100)
+        return {"iv": round(current, 1), "iv_rank": round(rank, 1)}
     except Exception:
         return {"iv": 0, "iv_rank": 0}
+
+def get_market_metrics(symbols):
+    """Real implied-volatility-rank data straight from Tastytrade's /market-metrics
+    endpoint (batched, up to 50 symbols per request). Returns {symbol: {iv, iv_rank}}."""
+    out = {}
+    if not symbols or not ensure_tastytrade_token():
+        return out
+    for i in range(0, len(symbols), 50):
+        chunk = symbols[i:i + 50]
+        try:
+            resp = requests.get(f"{TASTY_BASE}/market-metrics",
+                                 params={"symbols": ",".join(chunk)},
+                                 headers=tasty_headers, timeout=15)
+            if resp.status_code != 200:
+                continue
+            for item in resp.json().get("data", {}).get("items", []):
+                sym  = item.get("symbol")
+                ivx  = item.get("implied-volatility-index")
+                rank = item.get("tw-implied-volatility-index-rank") or item.get("implied-volatility-index-rank")
+                if not sym or ivx is None or rank is None:
+                    continue
+                try:
+                    out[sym] = {"iv": round(float(ivx) * 100, 1), "iv_rank": round(float(rank) * 100, 1)}
+                except (TypeError, ValueError):
+                    continue
+        except Exception as e:
+            print(f"  [WARN] market-metrics: {e}")
+    return out
+
+def get_iv_rank(ticker, metrics_cache=None):
+    """Real IV rank from Tastytrade when available, falling back to the realized-vol
+    proxy for symbols Tastytrade doesn't cover (e.g. yfinance futures tickers)."""
+    if metrics_cache is None:
+        metrics_cache = get_market_metrics([ticker])
+    if ticker in metrics_cache:
+        return metrics_cache[ticker]
+    return get_iv_rank_yf(ticker)
 
 def get_earnings_date(ticker):
     try:
@@ -943,7 +900,7 @@ def api_analysis(ticker):
     if not ind:
         return jsonify({"error": "Could not compute indicators for this ticker"})
     ind_1h     = compute_indicators_1h(ticker)
-    ivdata     = get_iv_rank_yf(ticker)
+    ivdata     = get_iv_rank(ticker)
     fund       = get_fundamentals(ticker)
     st_data    = get_stocktwits_sentiment(ticker)
     opts       = get_options_data(ticker)
@@ -1065,40 +1022,16 @@ def api_futures():
 @app.route("/quote")
 def quote():
     ticker = request.args.get("ticker", "SPY")
-    # Normalize VIX for Polygon (they use I:VIX, but yfinance uses ^VIX)
-    poly_ticker = ticker.replace("%5E", "").replace("^", "")
     try:
-        # ── Try Polygon for real-time price ──
-        poly_key = getattr(config, "POLYGON_API_KEY", "")
-        poly_price = None
-        poly_prev  = None
-        if poly_key:
-            try:
-                snap_url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{poly_ticker}"
-                sr = requests.get(snap_url, params={"apiKey": poly_key}, timeout=5)
-                if sr.status_code == 200:
-                    sd = sr.json().get("ticker", {})
-                    day = sd.get("day", {})
-                    prev_day = sd.get("prevDay", {})
-                    poly_price = day.get("c") or sd.get("lastTrade", {}).get("p")
-                    poly_prev  = prev_day.get("c")
-            except Exception:
-                pass
-
-        # ── yfinance for RSI / MA (always needed) ──
         tk        = yf.Ticker(ticker)
         hist_long = tk.history(period="1y", interval="1d")
         above_50ma = rsi_val = None
 
-        if poly_price:
-            price = round(float(poly_price), 2)
-            prev  = round(float(poly_prev), 2) if poly_prev else price
-        else:
-            hist = tk.history(period="5d", interval="1d")
-            if hist.empty:
-                return jsonify({"price": 0, "chg": 0, "chg_pct": 0})
-            price = round(float(hist["Close"].iloc[-1]), 2)
-            prev  = round(float(hist["Close"].iloc[-2]), 2) if len(hist) > 1 else price
+        hist = tk.history(period="5d", interval="1d")
+        if hist.empty:
+            return jsonify({"price": 0, "chg": 0, "chg_pct": 0})
+        price = round(float(hist["Close"].iloc[-1]), 2)
+        prev  = round(float(hist["Close"].iloc[-2]), 2) if len(hist) > 1 else price
 
         chg     = round(price - prev, 2)
         chg_pct = round((chg / prev) * 100, 2) if prev else 0
@@ -1114,7 +1047,7 @@ def quote():
 
         return jsonify({"price": price, "chg": chg, "chg_pct": chg_pct,
                         "above_50ma": above_50ma, "rsi": rsi_val,
-                        "source": "polygon" if poly_price else "yfinance"})
+                        "source": "yfinance"})
     except Exception as e:
         return jsonify({"error": str(e), "price": 0, "chg": 0, "chg_pct": 0})
 
@@ -1183,64 +1116,87 @@ def delete_position(pos_id):
     return jsonify({"ok": True})
 
 # ── Main scan ─────────────────────────────────────────────
+def scan_ticker(ticker, metrics_cache):
+    """Runs all per-ticker work for one symbol. Returns (leaps_item, puts_item, alerts)
+    so the caller can collect results without sharing mutable state across threads."""
+    print(f"  → {ticker}")
+    alerts = []
+    leaps_item = puts_item = None
+
+    ind = compute_indicators(ticker)
+    if not ind:
+        return leaps_item, puts_item, alerts
+    ind_1h = compute_indicators_1h(ticker)
+    ivdata = get_iv_rank(ticker, metrics_cache)
+
+    leaps_score, leaps_signals = score_ticker(ticker, ind, ivdata, for_leaps=True, ind_1h=ind_1h)
+    puts_score,  puts_signals  = score_ticker(ticker, ind, ivdata, for_leaps=False)
+    leaps_bull = [s["label"] for s in leaps_signals if s["bullish"]]
+    leaps_bear = [s["label"] for s in leaps_signals if not s["bullish"]]
+    puts_bull  = [s["label"] for s in puts_signals  if s["bullish"]]
+    puts_bear  = [s["label"] for s in puts_signals  if not s["bullish"]]
+
+    if ind["rsi"] > 75:    alerts.append({"ticker": ticker, "msg": f"RSI overbought at {ind['rsi']} — review LEAPS exits"})
+    if ind["bear_div"]:    alerts.append({"ticker": ticker, "msg": "Bearish RSI divergence — caution on longs"})
+    if ind["death_cross"]: alerts.append({"ticker": ticker, "msg": "Death cross — avoid new LEAPS entries"})
+
+    base = {"ticker": ticker, "price": ind["price"], "rsi": ind["rsi"],
+            "iv_rank": ivdata["iv_rank"], "ma20": ind["ma20"], "ma50": ind["ma50"],
+            "ma200": ind["ma200"], "vol_ratio": ind["vol_ratio"],
+            "hi52": ind.get("hi52"), "lo52": ind.get("lo52")}
+
+    opts           = get_options_data(ticker)
+    leaps_contract = best_contract(opts, "LEAPS - Bounce Scalp")
+    put_contract   = best_contract(opts, "Naked put")
+    blank_leaps    = {"type": "LEAPS - Bounce Scalp", "strike": "—", "exp": "—", "dte": "—", "delta": "—", "mid": "—", "source": "—"}
+    blank_put      = {"type": "Naked put",            "strike": "—", "exp": "—", "dte": "—", "delta": "—", "mid": "—", "source": "—"}
+
+    ls = leaps_score - (10 if ind["rsi"] > 70 else 0) - (15 if ivdata["iv_rank"] > config.LEAPS_MAX_IV_RANK else 0)
+    if ls >= config.MIN_SCORE:
+        lc               = leaps_contract or blank_leaps
+        earnings_dt      = get_earnings_date(ticker)
+        earnings_warning = None
+        if earnings_dt and isinstance(lc.get("dte"), int):
+            days_to_earn = (earnings_dt - date.today()).days
+            if 0 < days_to_earn <= lc["dte"]:
+                earnings_warning = earnings_dt.strftime("%b %d")
+        leaps_item = {**base, "score": ls, "contract": lc,
+                      "trade_type": "LEAPS - Bounce Scalp",
+                      "bull_signals": leaps_bull, "bear_signals": leaps_bear,
+                      "earnings_warning": earnings_warning}
+
+    ps = puts_score - (20 if ivdata["iv_rank"] < config.PUT_MIN_IV_RANK else 0) - (15 if ind["death_cross"] else 0) - (10 if ind["bear_div"] else 0)
+    if ps >= config.MIN_SCORE:
+        pc      = put_contract or blank_put
+        cushion = support_cushion_info(pc.get("strike"), ind) if isinstance(pc.get("strike"), (int, float)) else None
+        puts_item = {**base, "score": ps, "contract": pc,
+                     "trade_type": "Naked put",
+                     "bull_signals": puts_bull, "bear_signals": puts_bear,
+                     "support_cushion": cushion}
+
+    return leaps_item, puts_item, alerts
+
 def run_scan():
     global scan_results
     scan_results["status"] = "Scanning..."
     watchlist = load_watchlist()
     print(f"\n[SCAN] {datetime.now().strftime('%I:%M %p')} — {len(watchlist)} tickers")
     leaps_list, puts_list, alerts = [], [], []
+    metrics_cache = get_market_metrics(watchlist)
+    print(f"  [INFO] Real IV rank from Tastytrade for {len(metrics_cache)}/{len(watchlist)} symbols")
 
-    for ticker in watchlist:
-        print(f"  → {ticker}")
-        ind = compute_indicators(ticker)
-        if not ind: continue
-        ind_1h = compute_indicators_1h(ticker)
-        ivdata = get_iv_rank_yf(ticker)
-
-        leaps_score, leaps_signals = score_ticker(ticker, ind, ivdata, for_leaps=True, ind_1h=ind_1h)
-        puts_score,  puts_signals  = score_ticker(ticker, ind, ivdata, for_leaps=False)
-        leaps_bull = [s["label"] for s in leaps_signals if s["bullish"]]
-        leaps_bear = [s["label"] for s in leaps_signals if not s["bullish"]]
-        puts_bull  = [s["label"] for s in puts_signals  if s["bullish"]]
-        puts_bear  = [s["label"] for s in puts_signals  if not s["bullish"]]
-
-        if ind["rsi"] > 75:    alerts.append({"ticker": ticker, "msg": f"RSI overbought at {ind['rsi']} — review LEAPS exits"})
-        if ind["bear_div"]:    alerts.append({"ticker": ticker, "msg": "Bearish RSI divergence — caution on longs"})
-        if ind["death_cross"]: alerts.append({"ticker": ticker, "msg": "Death cross — avoid new LEAPS entries"})
-
-        base = {"ticker": ticker, "price": ind["price"], "rsi": ind["rsi"],
-                "iv_rank": ivdata["iv_rank"], "ma20": ind["ma20"], "ma50": ind["ma50"],
-                "ma200": ind["ma200"], "vol_ratio": ind["vol_ratio"],
-                "hi52": ind.get("hi52"), "lo52": ind.get("lo52")}
-
-        opts           = get_options_data(ticker)
-        leaps_contract = best_contract(opts, "LEAPS - Bounce Scalp")
-        put_contract   = best_contract(opts, "Naked put")
-        blank_leaps    = {"type": "LEAPS - Bounce Scalp", "strike": "—", "exp": "—", "dte": "—", "delta": "—", "mid": "—", "source": "—"}
-        blank_put      = {"type": "Naked put",            "strike": "—", "exp": "—", "dte": "—", "delta": "—", "mid": "—", "source": "—"}
-
-        ls = leaps_score - (10 if ind["rsi"] > 70 else 0) - (15 if ivdata["iv_rank"] > config.LEAPS_MAX_IV_RANK else 0)
-        if ls >= config.MIN_SCORE:
-            lc               = leaps_contract or blank_leaps
-            earnings_dt      = get_earnings_date(ticker)
-            earnings_warning = None
-            if earnings_dt and isinstance(lc.get("dte"), int):
-                days_to_earn = (earnings_dt - date.today()).days
-                if 0 < days_to_earn <= lc["dte"]:
-                    earnings_warning = earnings_dt.strftime("%b %d")
-            leaps_list.append({**base, "score": ls, "contract": lc,
-                               "trade_type": "LEAPS - Bounce Scalp",
-                               "bull_signals": leaps_bull, "bear_signals": leaps_bear,
-                               "earnings_warning": earnings_warning})
-
-        ps = puts_score - (20 if ivdata["iv_rank"] < config.PUT_MIN_IV_RANK else 0) - (15 if ind["death_cross"] else 0) - (10 if ind["bear_div"] else 0)
-        if ps >= config.MIN_SCORE:
-            pc      = put_contract or blank_put
-            cushion = support_cushion_info(pc.get("strike"), ind) if isinstance(pc.get("strike"), (int, float)) else None
-            puts_list.append({**base, "score": ps, "contract": pc,
-                              "trade_type": "Naked put",
-                              "bull_signals": puts_bull, "bear_signals": puts_bear,
-                              "support_cushion": cushion})
+    with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
+        futures = {executor.submit(scan_ticker, ticker, metrics_cache): ticker for ticker in watchlist}
+        for future in concurrent.futures.as_completed(futures):
+            ticker = futures[future]
+            try:
+                leaps_item, puts_item, ticker_alerts = future.result()
+            except Exception as e:
+                print(f"  [ERR] {ticker}: {e}")
+                continue
+            if leaps_item: leaps_list.append(leaps_item)
+            if puts_item:  puts_list.append(puts_item)
+            alerts.extend(ticker_alerts)
 
     # Position alerts
     price_map = {item["ticker"]: item["price"] for item in leaps_list + puts_list}
@@ -1305,9 +1261,7 @@ if __name__ == "__main__":
     print("  OPTIONS SCANNER v2")
     print("=" * 55)
     ai_key = getattr(config, "ANTHROPIC_API_KEY", "")
-    poly_key = getattr(config, "POLYGON_API_KEY", "")
     print(f"[INFO] AI Analysis: {'Enabled (Anthropic)' if ai_key else 'Disabled — add ANTHROPIC_API_KEY to config.py'}")
-    print(f"[INFO] Polygon data: {'Enabled' if poly_key else 'Using yfinance (add POLYGON_API_KEY for live data)'}")
     if login_tastytrade():
         print("[OK] Tastytrade authenticated")
     threading.Thread(target=refresh_token_loop, daemon=True).start()
