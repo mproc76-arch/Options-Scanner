@@ -335,8 +335,8 @@ body{background:var(--bg);color:var(--text);font-family:var(--font);font-size:14
       <div class="modal-field"><label>Account</label>
         <select id="modal-account">
           <option value="">— Select account —</option>
-          <option value="Roth IRA">Roth IRA (xACCT-REDACTED)</option>
-          <option value="Cash/Margin">Cash/Margin (xACCT-REDACTED)</option>
+          <option value="Roth IRA">Roth IRA</option>
+          <option value="Cash/Margin">Cash/Margin</option>
           <option value="Fidelity 401K">Fidelity 401K</option>
         </select>
       </div>
@@ -837,7 +837,7 @@ async function loadPortfolio(){
       var bal=acct.balance||{};
       html+='<div class="portfolio-account">'+
         '<div class="acct-hdr">'+
-          '<div class="acct-name">'+label+' ('+acct.account+')</div>'+
+          '<div class="acct-name">'+label+'</div>'+
           '<div class="acct-stats">'+
             (bal.net_liq?'<div class="acct-stat"><div class="val">$'+parseFloat(bal.net_liq).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})+'</div><div class="lbl">Net Liq</div></div>':'')+
             (bal.cash?'<div class="acct-stat"><div class="val">$'+parseFloat(bal.cash).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})+'</div><div class="lbl">Cash</div></div>':'')+
