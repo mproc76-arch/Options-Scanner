@@ -765,6 +765,11 @@ async function triggerStop(){
   document.getElementById('last-scan').textContent='Stopping scanner...';
   try{ await fetch('/control/stop',{method:'POST'}); }catch(e){}
   document.getElementById('last-scan').textContent='Scanner stopped. Relaunch scanner.py to continue.';
+  setTimeout(function(){
+    window.close();
+    // Some browsers block closing tabs that weren't opened by script — fall back to a blank page.
+    document.body.innerHTML='<div style="padding:40px;font-family:sans-serif;color:#888">Scanner stopped. You can close this tab.</div>';
+  }, 300);
 }
 
 async function triggerRestart(){
