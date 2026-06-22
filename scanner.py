@@ -5,7 +5,7 @@
 #  TradingView Charts, Optional AI (Anthropic API)
 # ============================================================
 
-import sys, time, threading, webbrowser, schedule, requests, os, json, uuid, random
+import sys, time, threading, webbrowser, schedule, requests, os, json, uuid, random, subprocess
 import concurrent.futures
 from datetime import datetime, date
 from flask import Flask, jsonify, render_template_string, request
@@ -297,8 +297,15 @@ def _compute_indicators_from_hist(hist):
     try:
         if hist.empty or len(hist) < 50:
             return None
+        if isinstance(hist.columns, pd.MultiIndex):
+            hist = hist.copy()
+            hist.columns = hist.columns.get_level_values(0)
         close  = hist["Close"]
         volume = hist["Volume"]
+        if isinstance(close, pd.DataFrame):
+            close = close.iloc[:, 0]
+        if isinstance(volume, pd.DataFrame):
+            volume = volume.iloc[:, 0]
         price  = close.iloc[-1]
         ma20   = close.rolling(20).mean()
         ma50   = close.rolling(50).mean()
@@ -1247,6 +1254,23 @@ def data():
 @app.route("/rescan", methods=["POST"])
 def rescan():
     threading.Thread(target=run_scan, daemon=True).start()
+    return jsonify({"ok": True})
+
+@app.route("/control/stop", methods=["POST"])
+def control_stop():
+    def _shutdown():
+        time.sleep(0.5)
+        os._exit(0)
+    threading.Thread(target=_shutdown, daemon=True).start()
+    return jsonify({"ok": True})
+
+@app.route("/control/restart", methods=["POST"])
+def control_restart():
+    def _restart():
+        time.sleep(0.5)
+        subprocess.Popen([sys.executable, os.path.abspath(__file__)], cwd=SCRIPT_DIR)
+        os._exit(0)
+    threading.Thread(target=_restart, daemon=True).start()
     return jsonify({"ok": True})
 
 def schedule_loop():

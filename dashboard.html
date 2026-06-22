@@ -250,6 +250,8 @@ body{background:var(--bg);color:var(--text);font-family:var(--font);font-size:14
   </div>
   <div class="header-right">
     <button class="btn" onclick="triggerRescan()">Rescan now</button>
+    <button class="btn" onclick="triggerRestart()">Restart</button>
+    <button class="btn" style="border-color:var(--red-border);color:var(--red)" onclick="triggerStop()">Stop</button>
   </div>
 </div>
 
@@ -303,7 +305,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--font);font-size:14
 
   <div class="panel active" id="panel-leaps"><div class="cards" id="cards-leaps"></div></div>
   <div class="panel" id="panel-puts"><div class="cards" id="cards-puts"></div></div>
-  <div class="panel" id="panel-futures" id="panel-futures"><div id="futures-content"><div class="empty"><div class="empty-title">Loading futures data...</div></div></div></div>
+  <div class="panel" id="panel-futures"><div id="futures-content"><div class="empty"><div class="empty-title">Loading futures data...</div></div></div></div>
   <div class="panel" id="panel-portfolio"><div id="portfolio-content"><div class="empty"><div class="empty-title">Click the Portfolio tab to load live account data</div></div></div></div>
   <div class="panel" id="panel-positions"><div class="cards" id="cards-positions"></div></div>
 </div>
@@ -758,6 +760,21 @@ async function triggerRescan(){
   setTimeout(function(){ fetchData(); document.getElementById('loading-bar').style.width='0%'; }, 4000);
 }
 
+async function triggerStop(){
+  if(!confirm('Stop the scanner? This shuts down scanner.py — you will need to relaunch it manually to use the dashboard again.')) return;
+  document.getElementById('last-scan').textContent='Stopping scanner...';
+  try{ await fetch('/control/stop',{method:'POST'}); }catch(e){}
+  document.getElementById('last-scan').textContent='Scanner stopped. Relaunch scanner.py to continue.';
+}
+
+async function triggerRestart(){
+  if(!confirm('Restart the scanner? The dashboard will briefly disconnect, then reload automatically with the latest config.')) return;
+  document.getElementById('last-scan').textContent='Restarting scanner...';
+  document.getElementById('status-dot').className='status-dot scanning';
+  try{ await fetch('/control/restart',{method:'POST'}); }catch(e){}
+  setTimeout(function(){ location.reload(); }, 6000);
+}
+
 // ── FUTURES ──
 async function loadFutures(){
   var el=document.getElementById('futures-content');
@@ -767,7 +784,10 @@ async function loadFutures(){
     var data=await resp.json();
     var futures=data.futures||[];
     if(!futures.length){ el.innerHTML='<div class="empty"><div class="empty-title">No futures data available</div></div>'; return; }
-    var html='<div style="margin-bottom:10px;font-size:11px;color:var(--muted)">Scanned: '+data.scanned_at+' — Technical scores for futures trend analysis</div>';
+    var html='<div style="margin-bottom:10px;font-size:11px;color:var(--muted);display:flex;justify-content:space-between;align-items:center">'+
+      '<span>Scanned: '+data.scanned_at+' — Technical scores for futures trend analysis</span>'+
+      '<button class="btn" style="font-size:11px;padding:4px 10px" onclick="loadFutures()">Refresh</button>'+
+      '</div>';
     html+='<div class="futures-grid">';
     futures.forEach(function(f){
       var biasTag=f.bias==='Bullish'?'bias-bull-tag':f.bias==='Bearish'?'bias-bear-tag':'bias-neut-tag';
